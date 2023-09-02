@@ -1,139 +1,168 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     hash::Hash,
     ops::AddAssign,
 };
 use trie_rs::{Trie, TrieBuilder};
 
-pub struct BpeModel<C: Eq + Hash + Ord + Clone> {
+struct VocabChar<C> {
+    char: C,
+    token_head: Cell<usize>,
+}
+
+pub struct Vocab<C: Ord + Hash + Clone> {
+    words: Vec<Vec<VocabChar<C>>>,
     tokens: HashSet<Vec<C>>,
-    tokens_builder: TrieBuilder<C>,
-    tokens_trie: Trie<C>,
 }
 
-enum ScannerBody<'data, C: Eq + Hash + Ord + Clone> {
-    First {
-        chars: HashSet<&'data C>,
-    },
-    Merge {
-        pairs: HashMap<(&'data [C], &'data [C]), usize>,
-    },
+pub struct Tokenizer<C: Ord + Hash + Clone> {
+    trie: Trie<C>,
 }
 
-pub struct Scanner<'model, 'data, C: Eq + Hash + Ord + Clone> {
-    parent: &'model mut BpeModel<C>,
-    body: ScannerBody<'data, C>,
-}
-
-impl<C: Eq + Hash + Ord + Clone> BpeModel<C> {
-    pub fn new() -> Self {
-        let tokens_builder = TrieBuilder::new();
-        let tokens_trie = tokens_builder.build();
+impl<C: Ord + Hash + Clone> Vocab<C> {
+    pub fn new<Words, Word>(words: Words) -> Self
+    where
+        Words: IntoIterator<Item = Word>,
+        Word: IntoIterator<Item = C>,
+    {
         Self {
+            words: words
+                .into_iter()
+                .map(|w| {
+                    w.into_iter()
+                        .map(|char| VocabChar {
+                            char,
+                            token_head: Cell::new(1),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|w| !w.is_empty())
+                .collect(),
             tokens: HashSet::new(),
-            tokens_builder,
-            tokens_trie,
         }
     }
 
-    pub fn scanner(&mut self) -> Scanner<C> {
-        let body = if self.tokens.is_empty() {
-            ScannerBody::First {
-                chars: HashSet::new(),
+    pub fn merge(&mut self) {
+        let mut pairs = HashMap::<Vec<C>, Vec<&VocabChar<C>>>::new();
+        for word in &self.words {
+            let mut a_pos = 0;
+            loop {
+                let a_len = word[a_pos].token_head.get();
+                let b_pos = a_pos + a_len;
+                if b_pos >= word.len() {
+                    break;
+                }
+                let b_len = word[b_pos].token_head.get();
+
+                let token = word[a_pos..][..a_len + b_len]
+                    .iter()
+                    .map(|x| x.char.clone())
+                    .collect();
+
+                pairs.entry(token).or_default().push(&word[a_pos]);
+                a_pos = b_pos;
             }
-        } else {
-            ScannerBody::Merge {
-                pairs: HashMap::new(),
-            }
-        };
-        Scanner { parent: self, body }
+        }
+
+        let best = pairs.into_iter().max_by_key(|(_, v)| v.len()).unwrap();
+
+        for a in best.1 {
+            a.token_head.set(best.0.len());
+        }
+        self.tokens.insert(best.0);
     }
 
-    pub fn tokenized<'a>(&self, word: &'a [C]) -> Vec<&'a [C]> {
-        let mut tokenized = Vec::new();
+    pub fn build(&self) -> Tokenizer<C>
+    where
+        C: Ord,
+    {
+        let mut builder = TrieBuilder::new();
+        for x in &self.tokens {
+            builder.push(x)
+        }
+        Tokenizer {
+            trie: builder.build(),
+        }
+    }
+}
 
-        let mut word = word;
+impl<C: Ord + Hash + Clone> Tokenizer<C> {
+    pub fn tokenize<'a>(&self, mut word: &'a [C]) -> Vec<&'a [C]> {
+        let mut result = Vec::new();
         while !word.is_empty() {
-            let hit_len = self
-                .tokens_trie
+            let n = self
+                .trie
                 .common_prefix_search(word)
                 .into_iter()
                 .map(|x| x.len())
                 .max()
                 .unwrap_or(1);
-
-            tokenized.push(&word[0..hit_len]);
-            word = &word[hit_len..];
+            result.push(&word[..n]);
+            word = &word[n..];
         }
-
-        tokenized
-    }
-}
-
-impl<'model, 'data, C: Eq + Hash + Ord + Clone> Scanner<'model, 'data, C> {
-    pub fn scan(&mut self, word: &'data [C], freq: usize) {
-        match &mut self.body {
-            ScannerBody::First { chars } => {
-                chars.extend(word);
-            }
-            ScannerBody::Merge { pairs } => {
-                let tokenized = self.parent.tokenized(word);
-
-                for (&a, &b) in tokenized.iter().zip(tokenized.iter().skip(1)) {
-                    pairs.entry((a, b)).or_default().add_assign(freq);
-                }
-            }
-        }
-    }
-
-    pub fn finish(self) {
-        match self.body {
-            ScannerBody::First { chars } => {
-                for c in chars {
-                    let t = vec![c.clone()];
-                    self.parent.tokens.insert(t.clone());
-                    self.parent.tokens_builder.push(t);
-                }
-            }
-            ScannerBody::Merge { pairs } => {
-                let best_pair = pairs.into_iter().max_by_key(|&(_, v)| v).unwrap().0;
-                let mut token = Vec::new();
-                token.extend(best_pair.0.into_iter().cloned());
-                token.extend(best_pair.1.into_iter().cloned());
-
-                if !self.parent.tokens.contains(&token) {
-                    self.parent.tokens.insert(token.clone());
-                }
-                self.parent.tokens_builder.push(token);
-                self.parent.tokens_trie = self.parent.tokens_builder.build();
-            }
-        }
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::File,
+        io::{BufRead, BufReader},
+    };
+
     use super::*;
 
     #[test]
     fn case01() {
-        let mut model = BpeModel::new();
-
         let data = "ABCDCDABCDCDE".chars().collect::<Vec<_>>();
-        let data = data.as_slice();
-
-        for _ in 0..5 {
-            let mut scanner = model.scanner();
-            scanner.scan(data, 1);
-            scanner.finish();
+        let mut vocab = Vocab::new([data.clone()]);
+        for _ in 0..4 {
+            vocab.merge();
         }
 
-        let tokenized = model
-            .tokenized(data)
+        let tokenizer = vocab.build();
+
+        let tokenized = tokenizer
+            .tokenize(&data)
             .into_iter()
             .map(|cs| cs.iter().copied().collect::<String>())
             .collect::<Vec<_>>()
             .join(" ");
         dbg!(tokenized);
+    }
+
+    #[test]
+    fn case02() {
+        let mut vocab = Vocab::new(
+            BufReader::new(File::open("data.txt").unwrap())
+                .lines()
+                .filter_map(|x| x.map(|x| x.chars().collect::<Vec<_>>()).ok()),
+        );
+
+        for _ in 0..100 {
+            vocab.merge()
+        }
+
+        let tokenizer = vocab.build();
+
+        let test_words = BufReader::new(File::open("data.txt").unwrap())
+            .lines()
+            .take(10)
+            .map(|x| x.map(|x| x.chars().collect::<Vec<_>>()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        for word in &test_words {
+            let tokens = tokenizer.tokenize(&word);
+
+            let display = tokens
+                .into_iter()
+                .map(|cs| cs.iter().copied().collect::<String>())
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{}", display)
+        }
     }
 }
