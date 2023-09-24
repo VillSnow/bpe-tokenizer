@@ -43,7 +43,7 @@ impl<C: Ord + Hash + Clone> Vocab<C> {
         }
     }
 
-    pub fn merge(&mut self) {
+    pub fn merge(&mut self, min_freq: usize) -> Result<(), ()> {
         let mut pairs = HashMap::<Vec<C>, Vec<&VocabChar<C>>>::new();
         for word in &self.words {
             let mut a_pos = 0;
@@ -65,12 +65,18 @@ impl<C: Ord + Hash + Clone> Vocab<C> {
             }
         }
 
-        let best = pairs.into_iter().max_by_key(|(_, v)| v.len()).unwrap();
+        let best = pairs
+            .into_iter()
+            .filter(|(_, v)| v.len() >= min_freq)
+            .max_by_key(|(_, v)| v.len());
+        let best = best.ok_or(())?;
 
         for a in best.1 {
             a.token_head.set(best.0.len());
         }
         self.tokens.insert(best.0);
+
+        Ok(())
     }
 
     pub fn build(&self) -> Tokenizer<C>
