@@ -85,6 +85,10 @@ impl<C: Ord + Hash + Clone> Vocab<C> {
             trie: builder.build(),
         }
     }
+
+    pub fn tokens(&self) -> &HashSet<Vec<C>> {
+        &self.tokens
+    }
 }
 
 impl<C: Ord + Hash + Clone> Tokenizer<C> {
